@@ -1,0 +1,171 @@
+##DOCKER COMPOSE AVANZADO CON PERSISTENCIA, ACCESO A GPU AMD, Y QDRANT
+# ESTE ES UN ARCHIVO DE CONFIGURACIÓN AVANZADO PARA UN STACK DE IA LOCAL.
+# NO FUNCIONA CON NVIDIA (SOLO AMD ROCM).
+
+version: '3.8'
+
+services:
+  pdr_tools_core:
+    build:
+      context: ./pdr_tools_core
+      dockerfile: Dockerfile
+    container_name: pdr_tools_core
+    restart: unless-stopped
+    # Add a volume mount for state persistence
+    volumes:
+      - /instances_state_data:/app/state # Mount a named volume for state file persistence
+      # Mount the app code as a bind mount during development for easier iteration
+      # In production, you'd typically copy the code in the Dockerfile as already defined
+      - ./pdr_tools_core/app:/app # Uncomment this during development if needed
+    environment:
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT_GRPC=6334
+      # - QDRANT_API_KEY=your_qdrant_api_key
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - EMBEDDING_MODEL_NAME=nomic-embed-text # Asegúrate de tener este modelo en Ollama
+      - DEFAULT_QDRANT_COLLECTION=system_instructions
+      - STATE_FILE_PATH=/app/state/gilgamesh_state.txt # Define where the state file is
+      # Add Postgres connection details to environment variables
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=ollama_db # Or a dedicated Gilgamesh DB
+      - POSTGRES_USER=ollama_user # Or a dedicated Gilgamesh user
+      - POSTGRES_PASSWORD=ollama_password # Or a dedicated Gilgamesh password
+    networks:
+      - ollama_network
+    depends_on:
+      - qdrant
+      - ollama
+      - postgres
+    ports:
+      - "8000:8000"
+      - "6900:6900"
+    # command: bash -c python3 main.py -m debugpy --listen localhost:6900 
+    # command: bash -c "python3 -m debugpy --listen 0.0.0.0:6900 --wait-for-client -m gunicorn --bind 0.0.0.0:8000 --workers 1 --worker-class uvicorn.workers.UvicornWorker main:app"
+
+  # --- SERVICIO OLLAMA PRINCIPAL (CONFIGURADO PARA GPU AMD) ---
+  ollama:
+    image: ollama/ollama:rocm # Imagen específica para AMD ROCm
+    container_name: ollama_Gilgamesh
+    restart: unless-stopped
+    security_opt:
+      - "seccomp:unconfined"
+    devices:
+      - /dev/kfd:/dev/kfd   # Driver principal de ROCm
+      - /dev/dri:/dev/dri   # Driver para renderizado directo
+    group_add:
+      # AÑADE AQUÍ LOS IDs DE LOS GRUPOS 'video' Y 'render' DE TU SISTEMA
+      # Ejecuta `getent group video render` en tu terminal para obtenerlos.
+      - "44"  # ID típico para 'video' (Ubuntu/Debian)
+      - "109" # ID típico para 'render' (Ubuntu/Debian)
+    volumes:
+      - /ollama_data:/root/.ollama
+    ports:
+      - "11434:11434" # Puerto para acceder a Ollama desde el host
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+      # ENABLE_IMAGE_GENERATION es una variable específica para Open WebUI,
+      # no para Ollama directamente. Se gestiona en el servicio open-webui.
+      # Para RAG con Ollama directamente, se necesitarían otras vars, pero la integración
+      # más común es vía Open WebUI.
+      # - HSA_OVERRIDE_GFX_VERSION=10.3.0 # NO USAR a menos que sea estrictamente necesario para tu GPU.
+    networks:
+      - ollama_network
+
+  # --- SERVICIO DE BASE DE DATOS VECTORIAL (QDRANT) ---
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant_Gilgamesh
+    restart: unless-stopped
+    volumes:
+      - qdrant_data:/qdrant/storage # Persistencia de los datos de Qdrant
+    ports:
+      # Puerto gRPC (API principal) para aplicaciones internas (Open WebUI, tu app Node/Python/Rust)
+      - "6334:6334"
+      # Puerto HTTP (para interfaz web y algunas APIs, si la necesitas externa)
+      # Puedes mapearlo a un puerto en tu host si necesitas acceder a la UI de Qdrant o a su API HTTP desde fuera del Docker network.
+      - "6333:6333" 
+    networks:
+      - ollama_network
+    environment:
+      # Configuraciones opcionales para Qdrant (ver docs de Qdrant para más detalles)
+      - QDRANT__SERVICE__GRPC_PORT=6334
+      - QDRANT__SERVICE__HTTP_PORT=6333
+
+  # --- INTERFAZ WEB PARA OLLAMA (Open WebUI) ---
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui_Gilgamesh
+    restart: unless-stopped
+    ports:
+      - "3000:8080" # Puerto para acceder a Open WebUI desde el host
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434 # Apunta al servicio Ollama
+      - WEBUI_SECRET_KEY=cambia_esta_clave_secreta_por_una_fuerte # ¡CAMBIA ESTO!
+      - WEBUI_URL=http://localhost:3000 # URL base para Open WebUI
+      
+      # --- CONFIGURACIÓN DE RAG Y QDRANT PARA OPEN WEBUI ---
+      # Habilita la funcionalidad RAG (Retrieval-Augmented Generation)
+      - ENABLE_RAG_WEB_LOADER=true
+      - ENABLE_RAG_HYBRID_SEARCH=true
+      - ENABLE_RAG_WEB_LOADER_SSL_VERIFICATION=false # Cuidado con esto en producción
+      
+      # URL para conectar Open WebUI con Qdrant
+      # Usamos el nombre del servicio 'qdrant' dentro de la red Docker
+      - QDRANT_URL=http://qdrant:6333 # Puerto HTTP de Qdrant para la integración
+      # Opcional: Clave API si Qdrant la requiere (por defecto no)
+      # - QDRANT_API_KEY=your_qdrant_api_key
+
+      # --- CONFIGURACIÓN DE INTEGRACIÓN CON AUTOMATIC1111 (Stable Diffusion) ---
+      # Asume que tendrás un servicio 'automatic1111' que Open WebUI pueda alcanzar
+      # Si ya lo tienes en otro compose o lo añadirás después, asegúrate de que esté en esta red
+      # - AUTOMATIC1111_BASE_URL=http://automatic1111:7860/ # URL para Stable Diffusion Web UI
+      - ENABLE_IMAGE_GENERATION=true # Habilita la generación de imágenes en Open WebUI
+      # Opcional: Puedes preconfigurar el modelo o tamaño por defecto si lo deseas
+      # - IMAGE_GENERATION_MODEL=v1-5-pruned-emaonly
+      # - IMAGE_SIZE=640x800
+    volumes:
+      - open_webui_data:/app/backend/data
+      # Si necesitas persistir datos de RAG como archivos, considera estos:
+      # - open_webui_uploads:/app/uploads
+      # - open_webui_cache:/app/cache
+      # - open_webui_logs:/app/logs
+    depends_on:
+      - ollama
+      - qdrant # Open WebUI depende de Qdrant para RAG
+      # Si añades automatic1111 en este mismo compose, también dependerá de él:
+      # - automatic1111
+    networks:
+      - ollama_network
+
+  # --- SERVICIO DE BASE DE DATOS PARA OPEN WEBUI/OLLAMA (Opcional, si lo necesitas para RAG) ---
+  postgres:
+    image: postgres:15-alpine
+    container_name: ollama_postgres_Gilgamesh
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ollama_db
+      POSTGRES_USER: ollama_user
+      POSTGRES_PASSWORD: ollama_password
+    ports:
+      - "5432:5432" # Puerto para acceder a Postgres desde el host
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # - ./init.sql:/docker-entrypoint-initdb.d/init.sql # Descomenta si tienes un script de inicialización
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ollama_user -d ollama_db"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - ollama_network
+volumes:
+  ollama_data:
+  open_webui_data:
+  qdrant_data:
+  postgres_data:
+
+
+networks:
+  ollama_network: # Cambiado el nombre de 'default' para ser más explícito
+    driver: bridge
